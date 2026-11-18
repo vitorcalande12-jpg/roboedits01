@@ -1,0 +1,123 @@
+name: 4 - Legendar (legenda inteligente)
+
+# Legenda gravada no vídeo: palavra por palavra, branco + amarelo na palavra dita, quem fala separado,
+# posição que não cobre o personagem. Duas etapas com a revisão do Claude no meio (ver LEGENDAR.md):
+#   rascunho → Claude revisa jobs/<job>/legendas/<id>.bruto.json e cria <id>.json → gravar
+# Cada corte roda numa máquina própria, ao mesmo tempo (3 cortes levam o tempo de 1).
+# Só o que é falado em português entra na legenda (fala do jogo em inglês etc. sai: scripts/filtro_lingua.py).
+on:
+  workflow_dispatch:
+    inputs:
+      etapa:
+        description: "rascunho (transcreve + vozes + posição) | gravar (usa a revisão) | direto (sem revisão)"
+        required: true
+        default: "rascunho"
+      job:
+        description: "Nome do trabalho = nome da Release com os cortes (ou a criar, para vídeo avulso)"
+        required: true
+      video:
+        description: "Opcional, vídeo avulso: link (YouTube, TikTok, Kick, .mp4) ou release:<tag>/<arquivo>"
+        required: false
+        default: ""
+      so:
+        description: "Opcional: só estes cortes (ex.: 01,03)"
+        required: false
+        default: ""
+      estilo:
+        description: "inteligente (aprovado) ou outro estilo do LEGENDAR.md"
+        required: false
+        default: "inteligente"
+      opcoes:
+        description: 'JSON opcional: {"lang":"pt","prompt":"nomes, gírias","topo_jogo":0.33,"falantes":2}'
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: legendar-${{ inputs.job }}-${{ inputs.etapa }}
+  cancel-in-progress: false
+
+jobs:
+  listar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      ids: ${{ steps.l.outputs.ids }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Quais cortes
+        id: l
+        run: |
+          if [ -n "${{ inputs.video }}" ] && [ "${{ inputs.etapa }}" != "gravar" ]; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg > /dev/null
+            pip install -q -U "yt-dlp[default,curl-cffi]"
+          fi
+          python scripts/legenda_job.py listar --para "${{ inputs.etapa }}" --job "${{ inputs.job }}" \
+            --so "${{ inputs.so }}" --video "${{ inputs.video }}"
+
+  legendar:
+    needs: listar
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        id: ${{ fromJson(needs.listar.outputs.ids) }}
+    env:
+      ETAPA: ${{ inputs.etapa }}
+      JOB: ${{ inputs.job }}
+      SO: ${{ matrix.id }}
+      ESTILO: ${{ inputs.estilo }}
+      OPCOES: ${{ inputs.opcoes }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # programas e modelos guardados entre execuções (não baixa tudo de novo a cada corte)
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cache/huggingface
+            ~/.cache/ms-playwright
+            models
+          key: legenda-${{ inputs.etapa == 'rascunho' && 'rascunho' || 'gravar' }}-v2-${{ hashFiles('scripts/instalar_legendas.sh') }}
+
+      - name: Instalar
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg > /dev/null
+          pip install -q -U "yt-dlp[default,curl-cffi]"
+          if [ "$ETAPA" = "rascunho" ]; then
+            pip install -q faster-whisper sherpa-onnx numpy opencv-python-headless
+            mkdir -p models && cd models
+            B=https://github.com/k2-fsa/sherpa-onnx/releases/download
+            [ -d sherpa-onnx-pyannote-segmentation-3-0 ] || curl -sSL "$B/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2" | tar xj
+            [ -f nemo_en_titanet_small.onnx ] || curl -sSL -o nemo_en_titanet_small.onnx "$B/speaker-recongition-models/nemo_en_titanet_small.onnx"
+            [ -f yolox.onnx ] || curl -sSL -o yolox.onnx "https://github.com/opencv/opencv_zoo/raw/main/models/object_detection_yolox/object_detection_yolox_2022nov.onnx"
+          else
+            bash scripts/instalar_legendas.sh
+          fi
+
+      - name: Legendar o corte ${{ matrix.id }}
+        run: python scripts/legenda_job.py "$ETAPA" --job "$JOB" --so "$SO" --estilo "${ESTILO:-inteligente}" --opcoes "$OPCOES"
+
+      - name: Salvar rascunho para a revisão
+        if: always() && env.ETAPA == 'rascunho'
+        run: |
+          [ -d jobs/"$JOB"/legendas ] || exit 0
+          git config user.name robo-cortes
+          git config user.email robo-cortes@users.noreply.github.com
+          git add jobs/"$JOB"/legendas
+          git commit -qm "legenda (rascunho): $JOB corte $SO" || exit 0
+          for i in 1 2 3 4 5 6 7 8; do git pull --rebase -q && git push -q && exit 0; sleep $((i*4)); done
